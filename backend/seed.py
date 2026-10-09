@@ -10,10 +10,11 @@ from app import (DEFAULT_BRANCHES, app, ensure_schema_compatibility, infer_quiz_
 from models import (Application, Branch, Certificate, Company, Course, InterviewQuestion,
                     Job, JobSkill, NptelCertificate, Placement, Project, Quiz, QuizQuestion, Skill,
                     Student, StudentSkill, User, db, Internship)
+from ml.skill_catalog import SKILL_METADATA, SKILL_NAMES
 
 random.seed(19)
 BRANCHES = DEFAULT_BRANCHES
-SKILLS = ["Python", "Java", "C", "C++", "SQL", "Data Structures", "Machine Learning", "Web Development", "Flask", "JavaScript", "HTML", "CSS", "Git", "Pandas", "NumPy", "Scikit-learn", "Power BI", "AWS", "Docker", "Communication", "Linux", "MySQL", "Statistics", "TensorFlow", "React", "Aptitude", "Excel", "MongoDB", "Cloud", "Problem Solving"]
+SKILLS = list(SKILL_NAMES)
 COMPANIES = ["Northstar Systems", "BluePeak Analytics", "Orbit Software", "CedarWorks", "Vertex Mobility", "BrightPath Labs", "Aster Digital", "Nimbus Cloud", "Foundry Tech", "Pioneer Consulting"]
 FIRST = ["Aarav", "Aditi", "Ananya", "Arjun", "Diya", "Ishaan", "Kabir", "Meera", "Neha", "Rohan", "Sana", "Vivaan", "Zoya", "Kiran", "Rahul", "Priya", "Dev", "Maya", "Nikhil", "Tara"]
 LAST = ["Sharma", "Patel", "Rao", "Iyer", "Khan", "Mehta", "Das", "Nair", "Singh", "Kapoor"]
@@ -305,7 +306,11 @@ def run_seed():
     for name in BRANCHES:
         if not Branch.query.filter_by(name=name).first():db.session.add(Branch(name=name))
     for name in SKILLS:
-        if not Skill.query.filter_by(name=name).first():db.session.add(Skill(name=name,category="Technical"))
+        skill = Skill.query.filter_by(name=name).first()
+        if not skill:
+            skill = Skill(name=name)
+            db.session.add(skill)
+        skill.category = SKILL_METADATA[name.casefold()]["category"]
     db.session.flush()
     skillmap={s.name:s for s in Skill.query.all()};branchmap={b.name:b for b in Branch.query.all()}
     companies=[]
@@ -384,11 +389,17 @@ def run_seed():
     aptitude=Quiz.query.filter_by(title="Aptitude Quick Check").first()
     if aptitude and QuizQuestion.query.filter_by(quiz_id=aptitude.id).count()==11:
         db.session.add(QuizQuestion(quiz_id=aptitude.id,prompt="A team completes 3 tasks per day for 4 days. How many tasks?",options=json.dumps(["7","12","14","9"]),answer_index=1,explanation="Multiply the daily rate by the number of days." ,difficulty="Hard",topic="Quantitative Reasoning"))
-    # Curated local learning catalogue with no recommendation API.
-    if Course.query.count()==0:
-        for skill in SKILLS[:18]:
-            db.session.add(Course(title=f"{skill} Foundations",skill=skill,level="Beginner",url=learning_resource_url(skill),duration="3–6 hours"))
-            db.session.add(Course(title=f"Build a Practical {skill} Project",skill=skill,level="Intermediate",url=learning_resource_url(skill, project=True),duration="Self-paced"))
+    # Seed a resource entry for every curated skill used by recommendations.
+    existing_course_titles = {course.title for course in Course.query.all()}
+    for skill in SKILLS:
+        foundation_title = f"{skill} Foundations"
+        project_title = f"Build a Practical {skill} Project"
+        if foundation_title not in existing_course_titles:
+            db.session.add(Course(title=foundation_title,skill=skill,level="Beginner",url=learning_resource_url(skill),duration="3–6 hours"))
+            existing_course_titles.add(foundation_title)
+        if project_title not in existing_course_titles:
+            db.session.add(Course(title=project_title,skill=skill,level="Intermediate",url=learning_resource_url(skill, project=True),duration="Self-paced"))
+            existing_course_titles.add(project_title)
     sync_learning_resource_urls()
     if InterviewQuestion.query.count()==0:
         bank=[("General","Tell me about a project you are proud of.",["project","built","challenge","result"]),("General","Describe a time you learned something quickly.",["learned","practice","feedback","result"]),("Python","How would you use a dictionary to count word frequencies?",["dictionary","key","count","iterate"]),("Python","Explain the difference between a list and a tuple.",["mutable","immutable","list","tuple"]),("SQL","How would you find duplicate email addresses in a table?",["group by","count","having","email"]),("SQL","Explain the difference between INNER JOIN and LEFT JOIN.",["matching","rows","left","null"]),("Machine Learning","What steps would you take to reduce overfitting?",["validation","regularization","data","model"]),("Data Structures","When would you choose a queue over a stack?",["fifo","lifo","order","queue"]),("Java","What is the purpose of an interface in Java?",["contract","methods","implement","class"]),("HR","How do you respond to constructive feedback?",["feedback","listen","action","improve"])]

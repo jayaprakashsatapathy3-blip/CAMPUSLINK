@@ -36,13 +36,14 @@ from config import Config
 from models import (Application, Branch, CalendarEvent, Certificate, Company, Course,
                     Feedback, Internship, Interview, InterviewQuestion, InterviewResult,
                     Job, JobSkill, Notification, NptelCertificate, Placement, PlacementOfficer, Project,
-                    CompanyPasswordResetOTP, PasswordRecoveryAttempt, PasswordResetGrant, QuickQuizAttempt, Quiz, QuizQuestion, QuizResult, ResumeAnalysis, Skill, Student,
+                    CompanyPasswordResetOTP, PasswordRecoveryAttempt, PasswordResetGrant, QuickQuizAttempt, Quiz, QuizQuestion, QuizResult, ResumeAnalysis, Skill, SkillLearningPlan, Student,
                     StudentProgress, StudentSkill, User, db)
 from ml.matching import (MAX_PLACEMENT_SEMESTER, MIN_PLACEMENT_SEMESTER,
                          match_student_to_job)
 from ml.prediction import placement_readiness
 from ml.recommendations import rank_skill_candidates
-from ml.skills import (canonical_skill_name, resolve_skill_key,
+from ml.career_skills import CAREER_PATHS, career_catalog, recommend_career_skills
+from ml.skills import (BUILTIN_SKILLS, canonical_skill_name, resolve_skill_key,
                        skill_text_contains, split_skill_values)
 from ai_service import (AI_REQUEST_TIMEOUT, AI_RETRY_ATTEMPTS, AI_RETRY_BASE_DELAY,
                         AIServiceError, GROQ_API_ENDPOINT, GROQ_MODEL_DEFAULT,
@@ -697,6 +698,20 @@ def current_company():
     return company
 
 
+def company_job_query(company=None):
+    company = company or current_company()
+    return Job.query.filter(Job.company_id == company.id)
+
+
+def company_owned_job(job_id, company=None):
+    return company_job_query(company).filter(Job.id == job_id).first()
+
+
+def company_application_query(company=None):
+    company = company or current_company()
+    return Application.query.join(Job, Application.job_id == Job.id).filter(Job.company_id == company.id)
+
+
 def parsed_json(value, fallback=None):
     try:
         return json.loads(value or "")
@@ -793,11 +808,11 @@ def job_data(job, viewer_student=None):
     branches = parsed_json(job.eligible_branches)
     result = {"id": job.id, "title": job.title, "description": job.description, "company_id": job.company_id, "company": company.company_name if company else "", "industry": company.industry if company else "", "company_location": company.location if company else "", "recruiter": user.name if user else "", "required_skills": skills, "minimum_cgpa": job.minimum_cgpa, "minimum_attendance": job.minimum_attendance, "eligible_branches": branches, "experience": job.experience, "certifications": parsed_json(job.certifications), "salary": job.salary, "location": job.location, "vacancies": job.vacancies, "deadline": job.deadline.isoformat() if job.deadline else None, "terms": job.terms, "created_at": job.created_at.isoformat()}
     if viewer_student:
-        result["match"] = calculate_match(viewer_student, job)
+        result["match"] = calculate_match(viewer_student, job, include_skill_resources=True)
     return result
 
 
-def calculate_match(student, job):
+def calculate_match(student, job, include_skill_resources=False):
     branch = db.session.get(Branch, student.branch_id) if student.branch_id else None
     skill_names = [db.session.get(Skill, x.skill_id).name for x in JobSkill.query.filter_by(job_id=job.id).all() if db.session.get(Skill, x.skill_id)]
     student_skills = [db.session.get(Skill, x.skill_id).name for x in StudentSkill.query.filter_by(student_id=student.id).all() if db.session.get(Skill, x.skill_id)]
@@ -808,6 +823,9 @@ def calculate_match(student, job):
     quiz = QuizResult.query.filter_by(student_id=student.id).all()
     quiz_average = sum(q.score for q in quiz) / len(quiz) if quiz else 0
     result = match_student_to_job({"skills": student_skills, "cgpa": student.cgpa, "attendance": student.attendance, "semester": student.semester, "branch": branch.name if branch else ""}, {"title": job.title, "description": job.description, "minimum_cgpa": job.minimum_cgpa, "minimum_attendance": job.minimum_attendance, "eligible_branches": parsed_json(job.eligible_branches), "certifications":parsed_json(job.certifications)}, skill_names, [p.title + " " + p.description for p in projects], [i.role + " " + i.description for i in internships], [c.name for c in certificates], quiz_average)
+    result["skill_recommendations"] = []
+    if not include_skill_resources:
+        return result
     catalog = Skill.query.all()
     course_recommendations = []
     available_courses = Course.query.order_by(Course.id).all()
@@ -828,13 +846,19 @@ def calculate_match(student, job):
 
 
 def create_vacancy_notifications(job):
+    company = db.session.get(Company, job.company_id)
+    company_name = company.company_name if company else "A company"
     for student in Student.query.all():
-        match = calculate_match(student, job)
-        if match["eligible"] and match["score"] >= 85:
-            key = f"vacancy:{job.id}:student:{student.id}"
-            user = db.session.get(User, student.user_id)
-            if user and not Notification.query.filter_by(dedupe_key=key).first():
-                db.session.add(Notification(user_id=user.id, title="New Vacancy Alert", message=f"You are a {match['score']}% estimated match for {job.title} at {job_data(job)['company']}.", link=f"#jobs/{job.id}", dedupe_key=key))
+        key = f"vacancy:{job.id}:student:{student.id}"
+        user = db.session.get(User, student.user_id)
+        if user and not Notification.query.filter_by(dedupe_key=key).first():
+            db.session.add(Notification(
+                user_id=user.id,
+                title="New Placement Opportunity",
+                message=f"{company_name} posted a new placement: {job.title}. Review the eligibility and application deadline.",
+                link=f"#jobs/{job.id}",
+                dedupe_key=key,
+            ))
 
 
 @app.errorhandler(400)
@@ -880,12 +904,17 @@ def register():
         return jsonify(error="College name is required for student registration"), 400
     if role == "COMPANY" and not company_name:
         return jsonify(error="Company name is required for company registration"), 400
+    phone = str(data.get("phone") or "").strip()
+    if role != "COMPANY" and not re.fullmatch(r"[0-9]{10}", phone):
+        return jsonify(error="Phone number must contain exactly 10 digits."), 400
+    if role == "COMPANY" and phone and not re.fullmatch(r"[0-9]{10}", phone):
+        return jsonify(error="Phone number must contain exactly 10 digits."), 400
     raw_date_of_birth = data.get("date_of_birth")
     if role != "COMPANY" and raw_date_of_birth not in (None, "") and not date_of_birth:
         return jsonify(error="Enter a valid date of birth"), 400
     if User.query.filter_by(email=email.lower()).first():
         return jsonify(error="An account with this email already exists"), 409
-    user = User(name=name, email=email.lower(), password_hash=generate_password_hash(password), role=role, phone=str(data.get("phone", ""))[:40], date_of_birth=date_of_birth)
+    user = User(name=name, email=email.lower(), password_hash=generate_password_hash(password), role=role, phone=phone or None, date_of_birth=date_of_birth)
     db.session.add(user)
     db.session.flush()
     if role == "STUDENT":
@@ -1201,6 +1230,9 @@ def update_profile():
     allowed_genders = {"", "Male", "Female", "Other", "Prefer not to say"}
     if "gender" in data and (not isinstance(data["gender"], str) or data["gender"] not in allowed_genders):
         return jsonify(error="Choose a valid gender option."), 400
+    phone = str(data.get("phone") or "").strip()
+    if "phone" in data and not re.fullmatch(r"[0-9]{10}", phone):
+        return jsonify(error="Phone number must contain exactly 10 digits."), 400
     collection_values = {}
     for key, max_items, max_length in (
         ("courses", 20, 160), ("achievements", 30, 500), ("interest_tags", 30, 120),
@@ -1224,7 +1256,7 @@ def update_profile():
         student.interests = data["interests"].strip()
         student.interest_tags = json.dumps(profile_string_list(student.interests, legacy_text=True), ensure_ascii=False)
     if "name" in data: g.user.name = str(data["name"]).strip()[:120]
-    if "phone" in data: g.user.phone = str(data["phone"]).strip()[:40]
+    if "phone" in data: g.user.phone = phone
     if "college_name" in data: student.college_name = str(data["college_name"]).strip()[:180]
     for key, limit in (("career_goal", 180), ("bio", 4000)):
         if key in data: setattr(student, key, str(data[key] or "").strip()[:limit])
@@ -1306,6 +1338,8 @@ def student_dashboard():
 @optional_token
 def list_jobs():
     query = Job.query.filter_by(active=True)
+    if g.get("user") and g.user.role == "COMPANY":
+        query = query.filter(Job.company_id == current_company().id)
     if request.args.get("company"): query = query.join(Company).filter(Company.company_name.ilike(f"%{request.args['company']}%"))
     if request.args.get("branch"):
         branch_pattern=f'%"{request.args["branch"]}"%';query = query.filter((Job.eligible_branches == "[]") | Job.eligible_branches.ilike(branch_pattern))
@@ -1318,7 +1352,7 @@ def list_jobs():
 @app.get("/api/jobs/<int:job_id>")
 @optional_token
 def get_job(job_id):
-    job = db.session.get(Job, job_id)
+    job = company_owned_job(job_id) if g.get("user") and g.user.role == "COMPANY" else db.session.get(Job, job_id)
     if not job: abort(404, "Vacancy not found")
     viewer = current_student() if g.get("user") and g.user.role == "STUDENT" else None
     return jsonify(job=job_data(job, viewer))
@@ -1404,8 +1438,8 @@ def parse_date(value):
 @app.put("/api/company/jobs/<int:job_id>")
 @roles("COMPANY")
 def update_job(job_id):
-    job = db.session.get(Job, job_id)
-    if not job or job.company_id != current_company().id: abort(404, "Vacancy not found")
+    job = company_owned_job(job_id)
+    if not job: abort(404, "Vacancy not found")
     data = json_body()
     for key, limit in (("title",160),("description",10000),("experience",100),("salary",80),("location",120),("terms",5000)):
         if key in data: setattr(job, key, str(data[key])[:limit])
@@ -1434,8 +1468,8 @@ def update_job(job_id):
 @app.delete("/api/company/jobs/<int:job_id>")
 @roles("COMPANY")
 def delete_job(job_id):
-    job = db.session.get(Job, job_id)
-    if not job or job.company_id != current_company().id: abort(404, "Vacancy not found")
+    job = company_owned_job(job_id)
+    if not job: abort(404, "Vacancy not found")
     job.active = False; db.session.commit(); return jsonify(message="Vacancy closed")
 
 
@@ -1443,7 +1477,7 @@ def delete_job(job_id):
 @roles("COMPANY")
 def company_jobs():
     company = current_company()
-    return jsonify(items=[job_data(j) for j in Job.query.filter_by(company_id=company.id).order_by(Job.created_at.desc()).all()])
+    return jsonify(items=[job_data(j) for j in company_job_query(company).order_by(Job.created_at.desc()).all()])
 
 
 @app.post("/api/jobs/<int:job_id>/apply")
@@ -1454,7 +1488,17 @@ def apply_job(job_id):
     if Application.query.filter_by(student_id=student.id, job_id=job.id).first(): return jsonify(error="You have already applied"), 409
     match = calculate_match(student, job)
     app_row = Application(student_id=student.id, job_id=job.id, status="Applied", match_score=match["score"])
-    db.session.add(app_row); db.session.commit()
+    db.session.add(app_row); db.session.flush()
+    company = db.session.get(Company, job.company_id)
+    if company:
+        db.session.add(Notification(
+            user_id=company.user_id,
+            title="New Placement Application",
+            message=f"{g.user.name} applied for {job.title}.",
+            link=f"#candidates?job_id={job.id}",
+            dedupe_key=f"application:{app_row.id}:company:{company.user_id}",
+        ))
+    db.session.commit()
     return jsonify(application=application_data(app_row), match=match), 201
 
 
@@ -1472,9 +1516,8 @@ def student_applications():
 @app.get("/api/company/jobs/<int:job_id>/applications")
 @roles("COMPANY", "ADMIN")
 def job_applications(job_id):
-    job = db.session.get(Job, job_id)
+    job = company_owned_job(job_id) if g.user.role == "COMPANY" else db.session.get(Job, job_id)
     if not job: abort(404, "Vacancy not found")
-    if g.user.role == "COMPANY" and job.company_id != current_company().id: abort(403)
     items = []
     for a in Application.query.filter_by(job_id=job.id).all():
         s = db.session.get(Student, a.student_id); match = calculate_match(s, job)
@@ -1486,15 +1529,23 @@ def job_applications(job_id):
 @app.get("/api/company/jobs/<int:job_id>/candidates")
 @roles("COMPANY", "ADMIN")
 def eligible_candidates(job_id):
-    job=db.session.get(Job,job_id)
+    job=company_owned_job(job_id) if g.user.role=="COMPANY" else db.session.get(Job,job_id)
     if not job:abort(404,"Vacancy not found")
-    if g.user.role=="COMPANY" and job.company_id!=current_company().id:abort(403)
     items=[]
-    for s in Student.query.all():
+    if g.user.role == "COMPANY":
+        applicant_ids = [row[0] for row in db.session.query(Application.student_id).filter_by(job_id=job.id).all()]
+        students = [db.session.get(Student, student_id) for student_id in applicant_ids]
+    else:
+        students = Student.query.all()
+    for s in students:
+        if not s:
+            continue
         fit=calculate_match(s,job)
-        # The screened list includes only students who satisfy explicit job eligibility.
-        if not fit["eligible"]:continue
         application=Application.query.filter_by(student_id=s.id,job_id=job.id).first()
+        # Recruiters only see profiles students submitted with an application.
+        # Placement officers retain the all-eligible-candidate screening view.
+        if g.user.role == "COMPANY" and not application:continue
+        if g.user.role == "ADMIN" and not fit["eligible"]:continue
         items.append({"id":application.id if application else None,"status":application.status if application else "Eligible","match_score":fit["score"],"match":fit,"student":student_data(s),"application_exists":bool(application)})
     items.sort(key=lambda x:x["match"]["score"],reverse=True)
     return jsonify(items=items)
@@ -1503,12 +1554,15 @@ def eligible_candidates(job_id):
 @app.post("/api/company/jobs/<int:job_id>/candidates/<int:student_id>/shortlist")
 @roles("COMPANY","ADMIN")
 def shortlist_candidate(job_id,student_id):
-    job=db.session.get(Job,job_id);student=db.session.get(Student,student_id)
-    if not job or not student:abort(404,"Job or student not found")
-    if g.user.role=="COMPANY" and job.company_id!=current_company().id:abort(403)
+    job=company_owned_job(job_id) if g.user.role=="COMPANY" else db.session.get(Job,job_id)
+    if not job:abort(404,"Job or student not found")
+    student=db.session.get(Student,student_id)
+    if not student:abort(404,"Job or student not found")
+    application=Application.query.filter_by(student_id=student.id,job_id=job.id).first()
+    if g.user.role == "COMPANY" and not application:
+        return jsonify(error="The student must apply before the company can shortlist them."),409
     fit=calculate_match(student,job)
     if not fit["eligible"]:return jsonify(error="Student does not meet the vacancy eligibility criteria"),409
-    application=Application.query.filter_by(student_id=student.id,job_id=job.id).first()
     if application:
         application.status="Shortlisted";application.match_score=fit["score"]
     else:
@@ -1520,10 +1574,14 @@ def shortlist_candidate(job_id,student_id):
 @app.put("/api/applications/<int:application_id>/status")
 @roles("COMPANY", "ADMIN")
 def change_application_status(application_id):
-    a = db.session.get(Application, application_id)
-    if not a: abort(404, "Application not found")
-    job = db.session.get(Job, a.job_id)
-    if g.user.role == "COMPANY" and job.company_id != current_company().id: abort(403)
+    if g.user.role == "COMPANY":
+        company = current_company()
+        a = company_application_query(company).filter(Application.id == application_id).first()
+        job = company_job_query(company).filter(Job.id == a.job_id).first() if a else None
+    else:
+        a = db.session.get(Application, application_id)
+        job = db.session.get(Job, a.job_id) if a else None
+    if not a or not job: abort(404, "Application not found")
     status = str(json_body().get("status", ""))
     if status not in {"Applied", "Shortlisted", "Assessment", "Interview", "Selected", "Offer", "Joined", "Rejected"}: return jsonify(error="Choose a valid application status"), 400
     a.status = status; a.updated_at = datetime.utcnow()
@@ -1545,12 +1603,216 @@ def match_endpoint():
 def skill_gap(job_id):
     job = db.session.get(Job, job_id)
     if not job: abort(404, "Vacancy not found")
-    result = calculate_match(current_student(), job)
+    result = calculate_match(current_student(), job, include_skill_resources=True)
     return jsonify(job=job.title, matched=result["matched_skills"], missing=result["missing_skills"],
                    matched_skills=result["matched_skills"], missing_skills=result["missing_skills"],
                    total_required_skills=result["total_required_skills"],
                    match_percentage=result["skill_match_percentage"], recommendations=result["recommendations"],
                    skill_recommendations=result["skill_recommendations"])
+
+
+def career_id_for_goal(goal):
+    key = re.sub(r"[^a-z0-9]+", "_", str(goal or "").casefold()).strip("_")
+    return key if key in CAREER_PATHS else None
+
+
+def sync_career_skill_plan(student, career_id, proficiency_by_key):
+    """Materialize the selected career requirements while preserving progress."""
+    career = CAREER_PATHS[career_id]
+    rows = {
+        row.skill_key: row
+        for row in SkillLearningPlan.query.filter_by(student_id=student.id, career_id=career_id).all()
+    }
+    progress_by_key = {}
+    for order, requirement in enumerate(career["skills"], start=1):
+        key = resolve_skill_key(requirement["name"])
+        proficiency = int(proficiency_by_key.get(key, 0))
+        row = rows.get(key)
+        if row is None:
+            row = SkillLearningPlan(
+                student_id=student.id,
+                career_id=career_id,
+                skill_key=key,
+                skill_name=requirement["name"],
+                target_proficiency=requirement["target"],
+                status="Not Started",
+            )
+            db.session.add(row)
+            rows[key] = row
+        if row.status == "Completed" and proficiency < requirement["target"]:
+            row.status = "Not Started"
+        if proficiency >= requirement["target"]:
+            row.status = "Completed"
+        row.skill_name = requirement["name"]
+        row.target_proficiency = requirement["target"]
+        row.priority = requirement["priority"]
+        row.recommendation_score = round(max(0, requirement["target"] - proficiency) * 100 / requirement["target"])
+        row.description = requirement["description"]
+        row.project = requirement["project"]
+        row.resources = json.dumps(requirement["resources"], ensure_ascii=False)
+        row.order_index = order
+        progress_by_key[key] = row.status
+    return rows, progress_by_key
+
+
+def student_skill_recommendation_payload(student):
+    profile = student_data(student)
+    career_id = career_id_for_goal(student.career_goal)
+    response = {
+        "careers": career_catalog(),
+        "career_goal": student.career_goal or "",
+        "career_id": career_id,
+        "current_skills": profile["skills"],
+        "required_skills": [],
+        "missing_skills": [],
+        "skill_gaps": [],
+        "recommendations": [],
+        "completed_skills": [],
+        "certifications": [],
+        "readiness": 0,
+        "method": "Rule-based career requirements, proficiency gaps, and saved learning progress",
+    }
+    if not career_id:
+        return response
+
+    proficiency_by_key = {
+        resolve_skill_key(item["name"]): max(0, min(100, int(item.get("proficiency") or 0)))
+        for item in profile["skills"]
+    }
+    rows, progress_by_key = sync_career_skill_plan(student, career_id, proficiency_by_key)
+    result = recommend_career_skills(career_id, proficiency_by_key, progress_by_key)
+    requirement_payload = []
+    completed = []
+    recommendations_by_key = {item["key"]: item for item in result["recommendations"]}
+    for item in result["required_skills"]:
+        row = rows[item["key"]]
+        row.priority = item["priority"]
+        row.recommendation_score = round(item["gap"] * 100 / item["target"]) if item["target"] else 0
+        record = {
+            **item,
+            "status": row.status,
+            "saved_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        requirement_payload.append(record)
+        if row.status == "Completed":
+            completed.append(record)
+        elif item["key"] in recommendations_by_key:
+            recommendations_by_key[item["key"]].update({"status": row.status, "saved_at": record["saved_at"]})
+
+    db.session.commit()
+    response.update({
+        "required_skills": requirement_payload,
+        "missing_skills": [item for item in requirement_payload if item["proficiency"] == 0],
+        "skill_gaps": [item for item in requirement_payload if item["proficiency"] < item["target"]],
+        "recommendations": sorted(
+            recommendations_by_key.values(),
+            key=lambda item: (0 if item["status"] == "In Progress" else 1,
+                              {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[item["priority"]], item["order"]),
+        ),
+        "completed_skills": completed,
+        "certifications": result["certifications"],
+        "readiness": result["readiness"],
+    })
+    return response
+
+
+@app.get("/api/student/skill-recommendations")
+@roles("STUDENT")
+def get_student_skill_recommendations():
+    return jsonify(student_skill_recommendation_payload(current_student()))
+
+
+@app.put("/api/student/skill-recommendations")
+@roles("STUDENT")
+def update_student_skill_recommendations():
+    data = json_body()
+    student = current_student()
+    requested_career = str(data.get("career_id", "")).strip()
+    career_id = requested_career or career_id_for_goal(student.career_goal)
+    if requested_career and requested_career not in CAREER_PATHS:
+        return jsonify(error="Choose one of the supported career paths."), 400
+    if not career_id and "skills" not in data:
+        return jsonify(error="Choose a career path or provide skills to save."), 400
+
+    normalized_skills = None
+    if "skills" in data:
+        raw_skills = data["skills"]
+        if not isinstance(raw_skills, list) or len(raw_skills) > 60:
+            return jsonify(error="Skills must be a list with no more than 60 entries."), 400
+        normalized_skills = {}
+        for item in raw_skills:
+            if not isinstance(item, dict):
+                return jsonify(error="Each skill must include a name and proficiency."), 400
+            name = str(item.get("name", "")).strip()
+            if not name or len(name) > 100 or re.search(r"[,;\r\n|]", name):
+                return jsonify(error="Each skill name must be 1–100 characters without list separators."), 400
+            raw_proficiency = item.get("proficiency")
+            try:
+                if isinstance(raw_proficiency, bool):
+                    raise ValueError
+                numeric_proficiency = float(raw_proficiency)
+                if not numeric_proficiency.is_integer():
+                    raise ValueError
+                proficiency = int(numeric_proficiency)
+            except (TypeError, ValueError, OverflowError):
+                return jsonify(error="Skill proficiency must be a whole number from 0 to 100."), 400
+            if proficiency < 0 or proficiency > 100:
+                return jsonify(error="Skill proficiency must be a whole number from 0 to 100."), 400
+            key = resolve_skill_key(name)
+            if key in normalized_skills:
+                normalized_skills[key]["proficiency"] = max(normalized_skills[key]["proficiency"], proficiency)
+            else:
+                normalized_skills[key] = {"name": canonical_skill_name(name)[:100], "proficiency": proficiency}
+
+    if career_id:
+        student.career_goal = CAREER_PATHS[career_id]["title"]
+    if normalized_skills is not None:
+        StudentSkill.query.filter_by(student_id=student.id).delete()
+        skill_catalog = Skill.query.all()
+        skill_index = {resolve_skill_key(item.name): item for item in skill_catalog}
+        for item in normalized_skills.values():
+            skill = get_or_create_skill(item["name"], skill_index)
+            db.session.add(StudentSkill(student_id=student.id, skill_id=skill.id, proficiency=item["proficiency"]))
+    db.session.flush()
+    result = student_skill_recommendation_payload(student)
+    return jsonify(result)
+
+
+@app.put("/api/student/skill-recommendations/progress")
+@roles("STUDENT")
+def update_student_skill_recommendation_progress():
+    data = json_body()
+    career_id = str(data.get("career_id", "")).strip()
+    skill_key = resolve_skill_key(data.get("skill", ""))
+    status = str(data.get("status", "")).strip()
+    if career_id not in CAREER_PATHS:
+        return jsonify(error="Choose a supported career path."), 400
+    if status not in {"Not Started", "In Progress", "Completed"}:
+        return jsonify(error="Choose Not Started, In Progress, or Completed."), 400
+    requirement = next((item for item in CAREER_PATHS[career_id]["skills"]
+                        if resolve_skill_key(item["name"]) == skill_key), None)
+    if not requirement:
+        return jsonify(error="That skill is not part of the selected career path."), 400
+
+    student = current_student()
+    profile = student_data(student)
+    proficiency_by_key = {resolve_skill_key(item["name"]): int(item.get("proficiency") or 0)
+                          for item in profile["skills"]}
+    rows, _progress = sync_career_skill_plan(student, career_id, proficiency_by_key)
+    row = rows[skill_key]
+    row.status = status
+    if status == "Completed":
+        skill_catalog = Skill.query.all()
+        skill_index = {resolve_skill_key(item.name): item for item in skill_catalog}
+        skill = get_or_create_skill(requirement["name"], skill_index)
+        student_skill = StudentSkill.query.filter_by(student_id=student.id, skill_id=skill.id).first()
+        if not student_skill:
+            student_skill = StudentSkill(student_id=student.id, skill_id=skill.id, proficiency=requirement["target"])
+            db.session.add(student_skill)
+        else:
+            student_skill.proficiency = max(student_skill.proficiency or 0, requirement["target"])
+    db.session.commit()
+    return jsonify(student_skill_recommendation_payload(student))
 
 
 @app.get("/api/recommendations/skills")
@@ -1584,6 +1846,8 @@ def recommendations():
     learning_progress = [row.item_name for row in StudentProgress.query.filter_by(student_id=student.id, item_type="course").all()]
     courses = Course.query.order_by(Course.id).all()
     candidate_names = {}
+    for name in BUILTIN_SKILLS:
+        candidate_names.setdefault(resolve_skill_key(name), canonical_skill_name(name))
     resources_by_skill = {}
     for skill in skill_catalog:
         for name in split_skill_values(skill.name, skill_catalog):
@@ -1623,7 +1887,7 @@ def recommendations():
         "suitable_quiz_topics": [topic for topic in weak_topics if skill_text_contains(topic, item["skill"])][:3] or [item["skill"]],
         "interview_prep_areas": [f"Explain one practical use of {item['skill']}", f"Practice a role-specific {item['skill']} question"],
     } for item in ranked[:10]]
-    method_label = ("Profile relevance, interests, TF-IDF similarity, quiz and vacancy-demand signals"
+    method_label = ("TF-IDF model fit to the curated 100-skill catalog, combined with profile, quiz, and vacancy-demand signals"
                     if method.startswith("tfidf_") else "Transparent profile, interest, quiz and vacancy-demand rules (ML unavailable or insufficient text)")
     return jsonify(items=items, career_goal=student.career_goal, method=method, method_label=method_label,
                    based_on={"branch": profile["branch"], "career_goal": student.career_goal,
@@ -3329,10 +3593,13 @@ def admin_dashboard():
     return jsonify(metrics={"students":students,"eligible_students":eligible_students,"companies":companies,"jobs":jobs,"applications":apps,"shortlisted":funnel["Shortlisted"],"interviews":funnel["Interview"],"selected":funnel["Selected"],"placed":placed,"placement_rate":round(placed/max(1,eligible_students)*100),"average_package":round(sum(packages)/len(packages),2) if packages else 0,"highest_package":max(packages) if packages else 0},branches=branch_rows,funnel=funnel,skill_demand=skill_demand_data(),companies_hiring=company_hiring_data(),package_analysis=package_bins,placement_trend=placement_trend)
 
 
-def skill_demand_data():
+def skill_demand_data(company_id=None):
     counts={}
     query=JobSkill.query.join(Job).join(Company).filter(Job.active.is_(True))
-    if request.args.get("company"):query=query.filter(Company.company_name.ilike(f"%{request.args['company']}%"))
+    if company_id is not None:
+        query=query.filter(Job.company_id==company_id)
+    elif request.args.get("company"):
+        query=query.filter(Company.company_name.ilike(f"%{request.args['company']}%"))
     if request.args.get("branch"):
         branch_pattern=f'%"{request.args["branch"]}"%';query=query.filter((Job.eligible_branches=="[]")|Job.eligible_branches.ilike(branch_pattern))
     if request.args.get("role"):query=query.filter(Job.title.ilike(f"%{request.args['role']}%"))
@@ -3347,17 +3614,28 @@ def skill_demand_data():
     return [{"skill":k,"jobs":v} for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:12]]
 
 
-def company_hiring_data():
+def company_hiring_data(company_id=None):
     result=[]
-    for c in Company.query.all():result.append({"company":c.company_name,"jobs":Job.query.filter_by(company_id=c.id,active=True).count(),"applications":Application.query.join(Job).filter(Job.company_id==c.id).count()})
+    companies = Company.query.filter_by(id=company_id).all() if company_id is not None else Company.query.all()
+    for c in companies:result.append({"company_id":c.id,"company":c.company_name,"jobs":company_job_query(c).filter(Job.active.is_(True)).count(),"applications":company_application_query(c).count()})
     return sorted(result,key=lambda x:x["jobs"],reverse=True)[:10]
 
 
 @app.get("/api/analytics/placements")
 @roles("ADMIN","COMPANY")
 def analytics_placements():
+    statuses = ["Applied", "Shortlisted", "Interview", "Selected", "Offer", "Joined"]
+    if g.user.role == "COMPANY":
+        company = current_company()
+        applications = company_application_query(company)
+        placements = Placement.query.join(Job, Placement.job_id == Job.id).filter(Job.company_id == company.id).all()
+        return jsonify(
+            branches=company_branch_analytics(company.id),
+            funnel={status: applications.filter(Application.status == status).count() for status in statuses},
+            packages=[placement.package_lpa for placement in placements],
+        )
     packages=[p.package_lpa for p in Placement.query.all()]
-    return jsonify(branches=branch_analytics(),funnel={s:Application.query.filter_by(status=s).count() for s in ["Applied","Shortlisted","Interview","Selected","Offer","Joined"]},packages=packages)
+    return jsonify(branches=branch_analytics(),funnel={s:Application.query.filter_by(status=s).count() for s in statuses},packages=packages)
 
 
 def branch_analytics():
@@ -3368,24 +3646,66 @@ def branch_analytics():
     return rows
 
 
+def company_branch_analytics(company_id):
+    applicants = db.session.query(Student.branch_id, Student.id, Student.year).join(
+        Application, Application.student_id == Student.id
+    ).join(Job, Job.id == Application.job_id).filter(Job.company_id == company_id).distinct().all()
+    placed_ids = {
+        student_id for (student_id,) in db.session.query(Placement.student_id).join(
+            Job, Placement.job_id == Job.id
+        ).filter(Job.company_id == company_id).distinct().all()
+    }
+    by_branch = {}
+    for branch_id, student_id, year in applicants:
+        by_branch.setdefault(branch_id, {})[student_id] = year
+    rows = []
+    for branch in Branch.query.order_by(Branch.name).all():
+        students = by_branch.get(branch.id, {})
+        if not students:
+            continue
+        eligible_ids = {student_id for student_id, year in students.items() if year == 4}
+        placed = len(eligible_ids & placed_ids)
+        rows.append({
+            "branch": branch.name,
+            "students": len(students),
+            "eligible": len(eligible_ids),
+            "placed": placed,
+            "rate": round(placed / max(1, len(eligible_ids)) * 100),
+        })
+    return rows
+
+
 @app.get("/api/analytics/branches")
 @roles("ADMIN","COMPANY")
-def analytics_branches():return jsonify(items=branch_analytics())
+def analytics_branches():
+    if g.user.role == "COMPANY":
+        return jsonify(items=company_branch_analytics(current_company().id))
+    return jsonify(items=branch_analytics())
 
 
 @app.get("/api/analytics/companies")
 @roles("ADMIN","COMPANY")
-def analytics_companies():return jsonify(items=company_hiring_data())
+def analytics_companies():
+    if g.user.role == "COMPANY":
+        return jsonify(items=company_hiring_data(current_company().id))
+    return jsonify(items=company_hiring_data())
 
 
 @app.get("/api/analytics/skills")
 @roles("ADMIN","COMPANY")
-def analytics_skills():return jsonify(items=skill_demand_data())
+def analytics_skills():
+    company_id = current_company().id if g.user.role == "COMPANY" else None
+    return jsonify(items=skill_demand_data(company_id))
 
 
 @app.get("/api/analytics/applications")
 @roles("ADMIN","COMPANY")
-def analytics_applications():return jsonify(funnel={s:Application.query.filter_by(status=s).count() for s in ["Applied","Shortlisted","Assessment","Interview","Selected","Offer","Joined","Rejected"]})
+def analytics_applications():
+    statuses = ["Applied", "Shortlisted", "Assessment", "Interview", "Selected", "Offer", "Joined", "Rejected"]
+    if g.user.role == "COMPANY":
+        applications = company_application_query()
+        return jsonify(funnel={status: applications.filter(Application.status == status).count() for status in statuses})
+    return jsonify(funnel={status: Application.query.filter_by(status=status).count() for status in statuses})
 
 
 @app.get("/api/admin/students")
@@ -3439,7 +3759,7 @@ def update_company_profile():
 @app.get("/api/company/dashboard")
 @roles("COMPANY")
 def company_dashboard():
-    company=current_company();jobs=Job.query.filter_by(company_id=company.id).all();apps=Application.query.join(Job).filter(Job.company_id==company.id).all()
+    company=current_company();jobs=company_job_query(company).all();apps=company_application_query(company).all()
     return jsonify(metrics={"jobs":len(jobs),"applications":len(apps),"shortlisted":sum(a.status=="Shortlisted" for a in apps),"interviews":sum(a.status=="Interview" for a in apps)},jobs=[job_data(j) for j in jobs],funnel={s:sum(a.status==s for a in apps) for s in ["Applied","Shortlisted","Interview","Selected","Joined"]})
 
 

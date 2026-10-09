@@ -500,6 +500,16 @@ tbody tr:hover { background: #f7f9fc; }
 .coach-report-section p,.coach-recommendations p { margin:4px 0; font-size:.77rem; }
 .coach-recommendations { padding:13px; margin-bottom:16px; border:1px solid #dce9ed; border-radius:12px; background:#f5fbfc; }
 .coach-recommendations > p.muted { margin-top:10px; }
+.page-back-control { display:flex; justify-content:flex-start; margin:-11px 0 15px; }
+.page-back-button { display:inline-flex; align-items:center; gap:8px; min-height:38px; padding:7px 12px; border:1px solid var(--line); border-radius:10px; background:var(--surface); color:var(--primary-color); font-size:.84rem; font-weight:700; box-shadow:0 2px 8px rgba(26,48,70,.035); }
+.page-back-button > span:first-child { font-size:1.15rem; line-height:1; }
+.page-back-button:hover { border-color:#a9bfd5; background:var(--soft-blue); transform:translateX(-2px); }
+.auth-wrap .auth-back { display:block; width:fit-content; }
+.public-back-button { flex:none; margin-right:14px; }
+.auth-page-back { position:fixed; z-index:60; top:14px; left:14px; }
+@media(max-width:800px) { .page-back-control { margin-top:-7px; margin-bottom:12px; } }
+@media(max-width:800px) { .auth-wrap > .auth-art { padding-top:66px; } }
+@media(max-width:560px) { .page-back-button { min-height:36px; padding:6px 10px; } .public-back-button { margin-right:8px; } .auth-page-back { top:10px; left:10px; } }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 @media(max-width:800px) {
   .coach-start-layout { grid-template-columns:1fr; }

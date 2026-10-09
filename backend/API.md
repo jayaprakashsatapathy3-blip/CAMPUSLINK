@@ -27,6 +27,9 @@ For Student and Placement Officer accounts, `GET /auth/me` includes only `date_o
 - `GET /student/jobs` — active vacancies with an estimated match when a student token is supplied.
 - `GET /student/applications` — the student’s application records and status timelines.
 - `GET /student/notifications` — the student’s alerts.
+- `GET /student/skill-recommendations` — authenticated student career options, saved skills, proficiency gaps, prioritized resources, roadmap, and readiness score. The first GET creates the student’s saved requirement and recommendation rows for a selected career.
+- `PUT /student/skill-recommendations` — saves the selected `career_id` (`frontend_developer`, `backend_developer`, `full_stack_developer`, `data_analyst`, or `ai_engineer`) and/or replaces `skills` with `{ "name":"JavaScript", "proficiency":65 }` records. Skill proficiency is an integer from 0 to 100; up to 60 skills are accepted. The response includes the refreshed recommendation plan.
+- `PUT /student/skill-recommendations/progress` — body `{ "career_id":"frontend_developer", "skill":"React", "status":"In Progress" }`; status is `Not Started`, `In Progress`, or `Completed`. Marking a skill completed raises its saved profile proficiency to at least the career target.
 - `GET /student/roadmap`, `GET /student/preparation`, `PUT /student/progress` — roadmap and progress snapshots. Progress body: `{ "item_type":"roadmap", "item_name":"...", "progress":65 }`.
 - `GET /branches`, `GET /skills` — configured reference values.
 
@@ -38,7 +41,8 @@ For Student and Placement Officer accounts, `GET /auth/me` includes only `date_o
 - `GET /resume/analysis` — latest saved analysis.
 - `POST /matching/calculate` — body `{ "job_id": 12 }`; returns score, matched/missing skills, eligibility checks, reasons, and next steps.
 - `GET /skill-gap/<job_id>` — skill overlap and missing requirements for a vacancy.
-- `GET /recommendations/skills` — in-demand skills not already on the student profile, with local resource suggestions.
+- `GET /recommendations/skills` — ranks unowned skills from the 100-skill catalog using a TF-IDF model fit at backend startup, plus profile, quiz, and active-vacancy signals; includes local resource suggestions and the method label. It does not use student outcomes as training labels.
+- The Skill Recommendations page uses a separate rule-based career-path catalogue with official learning links. The score compares saved proficiency against each role target, weights role requirements, and keeps career-specific learning status in `skill_learning_plans`.
 - `POST /communication/assess` — `{ "answer":"..." }`; returns local relevance, clarity, grammar indicators, vocabulary and structure signals.
 
 ## Vacancies and applications
@@ -47,10 +51,10 @@ For Student and Placement Officer accounts, `GET /auth/me` includes only `date_o
 - `GET /company/jobs` — recruiter’s vacancies.
 - `POST /company/jobs` — recruiter creates a vacancy. Core fields: `title`, `description`, `required_skills` (array or comma-separated), `minimum_cgpa`, `minimum_attendance`, `eligible_branches` (array), `experience`, `certifications`, `salary`, `location`, `vacancies`, `deadline`, `terms`.
 - `PUT /company/jobs/<id>` — recruiter updates their vacancy. `DELETE /company/jobs/<id>` closes it (soft close).
-- `POST /jobs/<job_id>/apply` — student applies once; response includes the saved application and match explanation.
-- `GET /company/jobs/<job_id>/applications` — applications for an owned vacancy, ranked by match.
-- `GET /company/jobs/<job_id>/candidates` — only students who meet the vacancy’s branch, CGPA and attendance criteria, ranked by match.
-- `POST /company/jobs/<job_id>/candidates/<student_id>/shortlist` — creates or updates a shortlisted application if the student is eligible.
+- `POST /jobs/<job_id>/apply` — student applies once; the submitted profile is shared with the vacancy-owning company, which receives an in-app notification. The response includes the saved application and match explanation.
+- `GET /company/jobs/<job_id>/applications` — applications for an owned vacancy, ranked by match and including the applicant profile and contact details.
+- `GET /company/jobs/<job_id>/candidates` — recruiter view includes only students who applied; placement officers can still review eligible candidates.
+- `POST /company/jobs/<job_id>/candidates/<student_id>/shortlist` — recruiter can shortlist an eligible student only after that student has applied; placement officers may create a shortlist directly.
 - `PUT /applications/<id>/status` — recruiter for the owning job or placement officer; body `{ "status":"Interview" }`. Allowed states: `Applied`, `Shortlisted`, `Assessment`, `Interview`, `Selected`, `Offer`, `Joined`, `Rejected`.
 
 Creating a new vacancy checks eligible students and adds one deduplicated in-app alert to each eligible student with a score of at least 85. Match scores are **Estimated Job Match**, not the probability of hiring.

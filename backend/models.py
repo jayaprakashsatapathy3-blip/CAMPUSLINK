@@ -319,6 +319,26 @@ class StudentProgress(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class SkillLearningPlan(db.Model):
+    """Saved recommendation and progress snapshot for one student career path."""
+    __tablename__ = "skill_learning_plans"
+    __table_args__ = (db.UniqueConstraint("student_id", "career_id", "skill_key"),)
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True)
+    career_id = db.Column(db.String(60), nullable=False, index=True)
+    skill_key = db.Column(db.String(120), nullable=False)
+    skill_name = db.Column(db.String(100), nullable=False)
+    target_proficiency = db.Column(db.Integer, nullable=False)
+    priority = db.Column(db.String(12), nullable=False, default="MEDIUM")
+    recommendation_score = db.Column(db.Integer, nullable=False, default=0)
+    description = db.Column(db.String(500), nullable=False, default="")
+    project = db.Column(db.String(500), nullable=False, default="")
+    resources = db.Column(db.Text, nullable=False, default="[]")
+    order_index = db.Column(db.Integer, nullable=False, default=0)
+    status = db.Column(db.String(20), nullable=False, default="Not Started")
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class Placement(db.Model):
     __tablename__ = "placements"
     id = db.Column(db.Integer, primary_key=True)

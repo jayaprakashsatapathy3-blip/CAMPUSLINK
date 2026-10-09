@@ -25,8 +25,9 @@ from nlp.resume import analyze_resume
 from ml.prediction import placement_readiness
 from ml.recommendations import rank_skill_candidates
 from nlp.resume import extract_text as extract_resume_document
-from models import (Branch, Company, Course, Job, JobSkill, Placement, Quiz, QuizQuestion,
-                    QuickQuizAttempt, QuizResult, Skill, Student, User)
+from models import (Branch, Company, Course, Job, JobSkill,
+                    Notification, Placement, Quiz, QuizQuestion, QuickQuizAttempt,
+                    QuizResult, Skill, Student, User)
 
 
 class PlacementFeaturesTests(unittest.TestCase):
@@ -238,6 +239,172 @@ class PlacementFeaturesTests(unittest.TestCase):
         custom_branch = self.client.post("/api/company/jobs", json=job_data, headers=headers)
         self.assertEqual(custom_branch.status_code, 201)
         self.assertEqual(custom_branch.json["job"]["eligible_branches"], ["EEE"])
+
+    def test_company_accounts_are_isolated_across_jobs_applications_notifications_analytics_and_calendar(self):
+        def create_company(name, email):
+            with app.app_context():
+                user = User(name=name, email=email,
+                            password_hash=generate_password_hash("Password123!"), role="COMPANY")
+                db.session.add(user)
+                db.session.flush()
+                company = Company(user_id=user.id, company_name=name)
+                db.session.add(company)
+                db.session.commit()
+                return company.id, {"Authorization": "Bearer " + serializer.dumps({"uid": user.id})}
+
+        first_company_id, first_auth = create_company("Isolation Company One", "isolation-one@example.invalid")
+        second_company_id, second_auth = create_company("Isolation Company Two", "isolation-two@example.invalid")
+
+        second_student_headers = None
+        second_student_id = None
+        with app.app_context():
+            user = User(name="ECE Test Student", email="isolation-ece-student@example.invalid",
+                        password_hash=generate_password_hash("Password123!"), role="STUDENT")
+            db.session.add(user)
+            db.session.flush()
+            student = Student(user_id=user.id, student_number="ISOLATION-ECE", branch_id=self.ece_id,
+                              year=4, career_goal="Embedded Engineer")
+            db.session.add(student)
+            db.session.commit()
+            second_student_id = student.id
+            second_student_headers = {"Authorization": "Bearer " + serializer.dumps({"uid": user.id})}
+
+        first_job_response = self.client.post("/api/company/jobs", json={
+            "title": "Python Role One", "eligible_branches": ["CSE"], "required_skills": ["Python"],
+        }, headers=first_auth)
+        second_job_response = self.client.post("/api/company/jobs", json={
+            "title": "Java Role Two", "eligible_branches": ["ECE"], "required_skills": ["Java"],
+        }, headers=second_auth)
+        self.assertEqual(first_job_response.status_code, 201, first_job_response.json)
+        self.assertEqual(second_job_response.status_code, 201, second_job_response.json)
+        first_job_id = first_job_response.json["job"]["id"]
+        second_job_id = second_job_response.json["job"]["id"]
+        own_job_update = self.client.put(
+            f"/api/company/jobs/{first_job_id}", json={"title": "Updated Python Role One"}, headers=first_auth
+        )
+        self.assertEqual(own_job_update.status_code, 200, own_job_update.json)
+
+        first_application_response = self.client.post(
+            f"/api/jobs/{first_job_id}/apply", json={}, headers=self.auth()
+        )
+        second_application_response = self.client.post(
+            f"/api/jobs/{second_job_id}/apply", json={}, headers=second_student_headers
+        )
+        self.assertEqual(first_application_response.status_code, 201, first_application_response.json)
+        self.assertEqual(second_application_response.status_code, 201, second_application_response.json)
+        first_application_id = first_application_response.json["application"]["id"]
+        second_application_id = second_application_response.json["application"]["id"]
+        second_status_update = self.client.put(
+            f"/api/applications/{second_application_id}/status", json={"status": "Shortlisted"}, headers=second_auth
+        )
+        self.assertEqual(second_status_update.status_code, 200, second_status_update.json)
+        with app.app_context():
+            db.session.add(Placement(student_id=second_student_id, company_id=second_company_id,
+                                     job_id=second_job_id, package_lpa=12.5, placement_date=date.today()))
+            first_notification = Notification(user_id=int(serializer.loads(first_auth["Authorization"][7:])["uid"]),
+                                              title="Company One alert", message="One")
+            second_notification = Notification(user_id=int(serializer.loads(second_auth["Authorization"][7:])["uid"]),
+                                               title="Company Two alert", message="Two")
+            db.session.add_all([first_notification, second_notification])
+            db.session.commit()
+            first_notification_id, second_notification_id = first_notification.id, second_notification.id
+
+        first_event_response = self.client.post("/api/calendar", json={
+            "title": "Company One interview day", "starts_at": "2026-11-01T10:00:00",
+        }, headers=first_auth)
+        second_event_response = self.client.post("/api/calendar", json={
+            "title": "Company Two interview day", "starts_at": "2026-11-02T10:00:00",
+        }, headers=second_auth)
+        self.assertEqual(first_event_response.status_code, 201, first_event_response.json)
+        self.assertEqual(second_event_response.status_code, 201, second_event_response.json)
+        first_event_id = first_event_response.json["event"]["id"]
+        second_event_id = second_event_response.json["event"]["id"]
+
+        first_jobs = self.client.get("/api/company/jobs", headers=first_auth)
+        second_jobs = self.client.get("/api/company/jobs", headers=second_auth)
+        self.assertEqual([job["id"] for job in first_jobs.json["items"]], [first_job_id])
+        self.assertEqual([job["id"] for job in second_jobs.json["items"]], [second_job_id])
+        self.assertEqual([job["id"] for job in self.client.get("/api/jobs", headers=first_auth).json["items"]], [first_job_id])
+        self.assertEqual([job["id"] for job in self.client.get("/api/jobs", headers=second_auth).json["items"]], [second_job_id])
+        self.assertEqual(len(self.client.get("/api/jobs").json["items"]), 2)
+        self.assertEqual(self.client.get(f"/api/jobs/{second_job_id}", headers=first_auth).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/jobs/{first_job_id}", headers=second_auth).status_code, 404)
+
+        for method, path, kwargs in (
+            ("put", f"/api/company/jobs/{second_job_id}", {"json": {"title": "Hijacked"}}),
+            ("delete", f"/api/company/jobs/{second_job_id}", {}),
+            ("get", f"/api/company/jobs/{second_job_id}/applications", {}),
+            ("get", f"/api/company/jobs/{second_job_id}/candidates", {}),
+            ("post", f"/api/company/jobs/{second_job_id}/candidates/{self.student_id}/shortlist", {"json": {}}),
+            ("put", f"/api/applications/{second_application_id}/status", {"json": {"status": "Rejected"}}),
+        ):
+            response = getattr(self.client, method)(path, headers=first_auth, **kwargs)
+            self.assertEqual(response.status_code, 404, (method, path, response.json))
+
+        first_owned_applications = self.client.get(
+            f"/api/company/jobs/{first_job_id}/applications", headers=first_auth
+        )
+        second_owned_applications = self.client.get(
+            f"/api/company/jobs/{second_job_id}/applications", headers=second_auth
+        )
+        self.assertEqual([item["id"] for item in first_owned_applications.json["items"]], [first_application_id])
+        self.assertEqual([item["id"] for item in second_owned_applications.json["items"]], [second_application_id])
+
+        first_notifications = self.client.get("/api/notifications", headers=first_auth)
+        second_notifications = self.client.get("/api/notifications", headers=second_auth)
+        self.assertEqual([item["id"] for item in first_notifications.json["items"]], [first_notification_id])
+        self.assertEqual([item["id"] for item in second_notifications.json["items"]], [second_notification_id])
+        self.assertEqual(self.client.put(f"/api/notifications/{second_notification_id}/read", json={}, headers=first_auth).status_code, 404)
+
+        first_events = self.client.get("/api/calendar", headers=first_auth)
+        second_events = self.client.get("/api/calendar", headers=second_auth)
+        self.assertEqual([item["id"] for item in first_events.json["items"]], [first_event_id])
+        self.assertEqual([item["id"] for item in second_events.json["items"]], [second_event_id])
+        self.assertEqual(self.client.put(f"/api/calendar/{second_event_id}", json={"title": "Hijacked"}, headers=first_auth).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/calendar/{second_event_id}", headers=first_auth).status_code, 404)
+
+        first_dashboard = self.client.get("/api/company/dashboard", headers=first_auth).json
+        second_dashboard = self.client.get("/api/company/dashboard", headers=second_auth).json
+        self.assertEqual([job["id"] for job in first_dashboard["jobs"]], [first_job_id])
+        self.assertEqual([job["id"] for job in second_dashboard["jobs"]], [second_job_id])
+        self.assertEqual(first_dashboard["metrics"]["applications"], 1)
+        self.assertEqual(second_dashboard["metrics"]["applications"], 1)
+
+        first_companies = self.client.get("/api/analytics/companies", headers=first_auth).json["items"]
+        second_companies = self.client.get("/api/analytics/companies", headers=second_auth).json["items"]
+        self.assertEqual([item["company"] for item in first_companies], ["Isolation Company One"])
+        self.assertEqual([item["company"] for item in second_companies], ["Isolation Company Two"])
+        first_skills = self.client.get("/api/analytics/skills", headers=first_auth).json["items"]
+        second_skills = self.client.get("/api/analytics/skills", headers=second_auth).json["items"]
+        self.assertEqual({item["skill"] for item in first_skills}, {"Python"})
+        self.assertEqual({item["skill"] for item in second_skills}, {"Java"})
+        filtered_first_skills = self.client.get(
+            "/api/analytics/skills?company=Isolation%20Company%20Two", headers=first_auth
+        ).json["items"]
+        self.assertEqual({item["skill"] for item in filtered_first_skills}, {"Python"})
+        first_placements = self.client.get("/api/analytics/placements", headers=first_auth).json
+        second_placements = self.client.get("/api/analytics/placements", headers=second_auth).json
+        self.assertEqual(first_placements["funnel"]["Applied"], 1)
+        self.assertEqual(first_placements["packages"], [])
+        self.assertEqual([row["branch"] for row in first_placements["branches"]], ["CSE"])
+        self.assertEqual(second_placements["funnel"]["Applied"], 0)
+        self.assertEqual(second_placements["funnel"]["Shortlisted"], 1)
+        self.assertEqual(second_placements["packages"], [12.5])
+        self.assertEqual([row["branch"] for row in second_placements["branches"]], ["ECE"])
+        self.assertEqual(
+            [row["branch"] for row in self.client.get("/api/analytics/branches", headers=first_auth).json["items"]],
+            ["CSE"],
+        )
+        self.assertEqual(
+            [row["branch"] for row in self.client.get("/api/analytics/branches", headers=second_auth).json["items"]],
+            ["ECE"],
+        )
+        first_funnel = self.client.get("/api/analytics/applications", headers=first_auth).json["funnel"]
+        second_funnel = self.client.get("/api/analytics/applications", headers=second_auth).json["funnel"]
+        self.assertEqual(first_funnel["Applied"], 1)
+        self.assertEqual(first_funnel["Shortlisted"], 0)
+        self.assertEqual(second_funnel["Applied"], 0)
+        self.assertEqual(second_funnel["Shortlisted"], 1)
 
     def test_branch_aware_chat_handles_custom_branches_and_typo_normalization(self):
         self.assertEqual(normalize_user_text("plz help me with an interveiw"), "please help me with an interview")
@@ -578,6 +745,7 @@ candidate@example.com 9876543210
             "email": "new-campus-student@example.invalid",
             "password": "Password123!",
             "role": "STUDENT",
+            "phone": "1234567890",
         }
         missing = self.client.post("/api/auth/register", json=payload)
         self.assertEqual(missing.status_code, 400)
@@ -611,6 +779,7 @@ candidate@example.com 9876543210
         payload["company_name"] = "Campus Systems Inc"
         registered = self.client.post("/api/auth/register", json=payload)
         self.assertEqual(registered.status_code, 201)
+        self.assertIsNone(registered.json["user"]["phone"])
         headers = {"Authorization": f"Bearer {registered.json['token']}"}
         profile = self.client.get("/api/company/profile", headers=headers)
         self.assertEqual(profile.status_code, 200)

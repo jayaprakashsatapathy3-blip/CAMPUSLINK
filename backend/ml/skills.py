@@ -3,17 +3,11 @@
 import re
 import unicodedata
 
+from .skill_catalog import SKILL_NAMES
 
-BUILTIN_SKILLS = (
-    "Python", "Java", "C", "C++", "C#", "SQL", "Machine Learning", "Scikit-learn",
-    "Pandas", "NumPy", "Flask", "Django", "HTML", "CSS", "JavaScript", "React",
-    "Git", "AWS", "Azure", "Docker", "Communication", "Data Structures", "Power BI",
-    "Excel", "TensorFlow", "PyTorch", "Linux", "MongoDB", "MySQL", "PostgreSQL",
-    "Statistics", "Tableau", "Node.js", "TypeScript", "Angular", "PHP", "Ruby", "Go",
-    "Kotlin", "Swift", "Redis", "Oracle Database", "Microsoft SQL Server", "SQLite",
-    "Google Cloud", "GCP", "Data Science", "Web Development", "Data Analytics",
-    "Aptitude", "Problem Solving", "Communication Skills", "PowerPoint", "Jupyter",
-)
+# Keep the common GCP spelling available to resume extraction while the seeded
+# catalog stores its canonical name, Google Cloud.
+BUILTIN_SKILLS = (*SKILL_NAMES, "GCP")
 
 
 def normalize_skill_name(value):

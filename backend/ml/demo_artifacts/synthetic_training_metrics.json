@@ -1,0 +1,58 @@
+{
+  "dataset_type": "synthetic_demo_only",
+  "records": 10000,
+  "seed": 42,
+  "features": [
+    "cgpa",
+    "attendance",
+    "skills",
+    "projects",
+    "internships",
+    "certificates",
+    "quiz_score",
+    "interview_score",
+    "branch"
+  ],
+  "target": "placed (1=yes, 0=no)",
+  "class_counts": {
+    "not_placed": 7062,
+    "placed": 2938
+  },
+  "label_source": "Simulated from a seeded probability formula; not real student outcomes.",
+  "model": "scikit-learn LogisticRegression with median imputation, standard scaling, and one-hot branch encoding",
+  "parameters": {
+    "max_iter": 500,
+    "class_weight": "balanced",
+    "random_state": 42
+  },
+  "evaluation": {
+    "split": "stratified 75/25 holdout",
+    "training_records": 7500,
+    "test_records": 2500,
+    "balanced_accuracy": 0.6516,
+    "roc_auc": 0.7157,
+    "confusion_matrix_labels": [
+      "not_placed",
+      "placed"
+    ],
+    "confusion_matrix": [
+      [
+        1149,
+        617
+      ],
+      [
+        255,
+        479
+      ]
+    ]
+  },
+  "final_model_fit_records": 10000,
+  "scikit_learn_version": "1.9.0",
+  "trained_at_utc": "2026-10-09T20:02:39.149882+00:00",
+  "artifacts": {
+    "dataset": "synthetic_student_training.csv",
+    "model": "synthetic_placement_model.joblib",
+    "metrics": "synthetic_training_metrics.json"
+  },
+  "warning": "Synthetic demo model only. Do not use its scores for real student decisions."
+}

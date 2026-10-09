@@ -4,12 +4,32 @@ import math
 import re
 
 from ml.skills import resolve_skill_key, split_skill_values
+from ml.skill_catalog import SKILL_CATALOG
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 except ImportError:
     TfidfVectorizer = cosine_similarity = None
+
+
+def _fit_skill_catalog_model():
+    """Fit IDF weights against the curated skill catalog once per process."""
+    if not TfidfVectorizer:
+        return None
+    documents = [item["document"] for item in SKILL_CATALOG]
+    try:
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
+        vectorizer.fit(documents)
+        return vectorizer
+    except ValueError:
+        return None
+
+
+_SKILL_CATALOG_VECTORIZER = _fit_skill_catalog_model()
+_SKILL_METADATA_BY_KEY = {
+    resolve_skill_key(item["name"]): item for item in SKILL_CATALOG
+}
 
 
 _ROLE_SKILL_GROUPS = (
@@ -72,6 +92,11 @@ def _values(value):
 
 def _skill_values(value):
     return split_skill_values(value)
+
+
+def _catalog_document(skill):
+    metadata = _SKILL_METADATA_BY_KEY.get(resolve_skill_key(skill))
+    return metadata["document"] if metadata else str(skill or "")
 
 
 def _has_phrase(text, phrase):
@@ -148,14 +173,20 @@ def rank_skill_candidates(context, candidates):
     context_parts = [context.get("branch", ""), *goals, *interests, *skills,
                      *project_technologies, *weak_topics, *learning_progress]
     query = " ".join(str(part) for part in context_parts if part)
-    documents = [" ".join([candidate["skill"], " ".join(candidate["resource_titles"])]) for candidate in candidates]
     similarity = [0.0] * len(candidates)
     method = "profile_interest_goal_and_demand_rules"
-    if TfidfVectorizer and query.strip():
+    if _SKILL_CATALOG_VECTORIZER and query.strip():
         try:
-            matrix = TfidfVectorizer(ngram_range=(1, 2), stop_words="english").fit_transform([query] + documents)
-            similarity = cosine_similarity(matrix[0:1], matrix[1:]).ravel().tolist()
-            method = "tfidf_profile_interest_goal_and_demand_rules"
+            query_vector = _SKILL_CATALOG_VECTORIZER.transform([query])
+            candidate_vectors = _SKILL_CATALOG_VECTORIZER.transform([
+                " ".join([
+                    _catalog_document(candidate["skill"]),
+                    " ".join(candidate["resource_titles"]),
+                ])
+                for candidate in candidates
+            ])
+            similarity = cosine_similarity(query_vector, candidate_vectors).ravel().tolist()
+            method = "tfidf_trained_100_skill_catalog_profile_and_demand_rules"
         except ValueError:
             pass
 

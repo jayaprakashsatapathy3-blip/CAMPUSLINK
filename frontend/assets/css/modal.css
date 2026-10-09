@@ -1,0 +1,4 @@
+.modal-backdrop{position:fixed;inset:0;background:rgba(11,29,49,.62);z-index:70;display:grid;place-items:center;padding:20px}
+.modal-card{background:#fff;border-radius:18px;padding:25px;max-height:min(88vh,800px);overflow:auto;width:min(100%,670px);box-shadow:0 25px 80px rgba(0,0,0,.25);position:relative}
+.modal-close{float:right;font-size:1.4rem;margin-left:12px}
+.modal-active{animation:toast-in .16s ease}
